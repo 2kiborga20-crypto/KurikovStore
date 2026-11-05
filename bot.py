@@ -56,7 +56,11 @@ STAR_PRICE_RUB = float(os.getenv("STAR_PRICE_RUB", "1.5")) # Сколько ст
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("stars-bot")
 
-# --- ИНИЦИАЛИЗАЦИЯ БОТОВ (с увеличенным таймаутом) ---
+# --- ОТКЛЮЧАЕМ СПАМ ОШИБОК СЕТИ ОТ AIOGRAM ---
+logging.getLogger('aiogram').setLevel(logging.CRITICAL)
+logging.getLogger('aiogram.dispatcher').setLevel(logging.CRITICAL)
+
+# --- ИНИЦИАЛИЗАЦИЯ БОТОВ ---
 bot = Bot(token=BOT_TOKEN, request_timeout=30)
 dp = Dispatcher()
 router = Router()
