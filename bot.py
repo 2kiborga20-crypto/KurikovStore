@@ -56,12 +56,12 @@ STAR_PRICE_RUB = float(os.getenv("STAR_PRICE_RUB", "1.5")) # Сколько ст
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("stars-bot")
 
-# --- ИНИЦИАЛИЗАЦИЯ БОТОВ ---
-bot = Bot(token=BOT_TOKEN)
+# --- ИНИЦИАЛИЗАЦИЯ БОТОВ (с увеличенным таймаутом) ---
+bot = Bot(token=BOT_TOKEN, request_timeout=30)
 dp = Dispatcher()
 router = Router()
 
-shop_bot = Bot(token=SHOP_BOT_TOKEN)
+shop_bot = Bot(token=SHOP_BOT_TOKEN, request_timeout=30)
 shop_dp = Dispatcher(storage=MemoryStorage())
 shop_router = Router()
 
@@ -405,7 +405,11 @@ async def get_username(m: Message, state: FSMContext):
     oid = f"SHOP_{m.from_user.id}_{int(m.date.timestamp())}"
     
     # Считаем сумму к оплате
-    price_rub = int(amount * STAR_PRICE_RUB)
+    try:
+        price_rub = int(amount * STAR_PRICE_RUB)
+    except Exception as e:
+        log.error(f"Ошибка подсчета цены: {e}. Проверь STAR_PRICE_RUB в Railway!")
+        price_rub = 0
     
     # Генерируем ссылку на оплату через Quickpay (без токена)
     params = {
@@ -465,25 +469,38 @@ async def process_paid(c: CallbackQuery):
         o = orders.get(oid)
         if not o or o["status"] != "waiting_payment":
             return await c.answer("Заказ не найден или уже обработан.", show_alert=True)
-        o["status"] = "ready" # Переводим в статус готовности к выдаче
+        o["status"] = "ready" 
         save()
     
     await c.message.edit_text("⏳ Заказ отправлен на проверку администратору. Ожидайте выдачи Stars.")
     await c.answer()
     
-    # Отправляем админу уведомление с кнопкой "Выдать"
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Выдать Stars", callback_data=f"ok:{oid}"),
         InlineKeyboardButton(text="❌ Отменить", callback_data=f"no:{oid}"),
     ]])
     
-    await notify(
-        f"💰 <b>Покупатель нажал «Я оплатил»!</b>\n"
-        f"Проверь поступление {int(o['amount'] * STAR_PRICE_RUB)} руб. на ЮMoney.\n\n"
-        + order_text(oid, o), 
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
+    # Логируем, что мы пытаемся отправить сообщение
+    log.info(f"Пытаюсь отправить уведомление админу {ADMIN_ID} по заказу {oid}")
+    
+    try:
+        try:
+            price_rub = int(o['amount'] * STAR_PRICE_RUB)
+        except Exception as e:
+            price_rub = 0
+            log.error(f"Ошибка подсчета цены: {e}.")
+            
+        await bot.send_message(
+            ADMIN_ID,
+            f"💰 <b>Покупатель нажал «Я оплатил»!</b>\n"
+            f"Проверь поступление {price_rub} руб. на ЮMoney.\n\n"
+            + order_text(oid, o), 
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+        log.info("Уведомление админу успешно отправлено!")
+    except Exception as e:
+        log.error(f"ОШИБКА ОТПРАВКИ АДМИНУ: {e}", exc_info=True)
 
 # ================== FUNPAY СЛУШАТЕЛЬ ==================
 USERNAME_FULL = re.compile(r"@?([A-Za-z][A-Za-z0-9_]{4,31})")
