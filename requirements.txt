@@ -1,0 +1,4 @@
+aiogram>=3.4
+python-dotenv
+FunPayAPI
+pyfragment==2026.2.0
