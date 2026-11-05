@@ -5,6 +5,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import urlencode
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
@@ -46,6 +47,11 @@ MIN_STARS = 50
 AUTO_DELIVERY = os.getenv("AUTO_DELIVERY", "0") == "1"
 MAX_AUTO_AMOUNT = int(os.getenv("MAX_AUTO_AMOUNT", "500"))
 DB_FILE = Path(os.getenv("DB_PATH", "orders.json"))
+USERS_FILE = Path(os.getenv("USERS_DB_PATH", "users.json"))
+
+# --- НАСТРОЙКИ ЮMONEY ---
+YOOMONEY_WALLET = need("YOOMONEY_WALLET") # Твой номер кошелька (410011...)
+STAR_PRICE_RUB = float(os.getenv("STAR_PRICE_RUB", "1.5")) # Сколько стоит 1 звезда в рублях
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("stars-bot")
@@ -62,7 +68,7 @@ shop_router = Router()
 lock = asyncio.Lock()
 funpay: Account = None
 
-# --- БАЗА ДАННЫХ ---
+# --- БАЗА ДАННЫХ ЗАКАЗОВ ---
 DB_FILE.parent.mkdir(parents=True, exist_ok=True)
 try:
     orders: dict = json.loads(DB_FILE.read_text("utf-8")) if DB_FILE.exists() else {}
@@ -74,6 +80,18 @@ def save():
     tmp = DB_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(orders, ensure_ascii=False, indent=2), "utf-8")
     tmp.replace(DB_FILE)
+
+# --- БАЗА ДАННЫХ ПОЛЬЗОВАТЕЛЕЙ (ДЛЯ РЕФЕРАЛОВ) ---
+try:
+    users: dict = json.loads(USERS_FILE.read_text("utf-8")) if USERS_FILE.exists() else {}
+except Exception:
+    log.exception("users.json повреждён, начинаю с пустого")
+    users = {}
+
+def save_users():
+    tmp = USERS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(users, ensure_ascii=False, indent=2), "utf-8")
+    tmp.replace(USERS_FILE)
 
 async def notify(text: str, **kw):
     await bot.send_message(ADMIN_ID, text, **kw)
@@ -128,7 +146,6 @@ async def deliver(oid: str) -> bool:
             o["status"] = "waiting_username"
             save()
         
-        # Если это заказ из магазина, пишем в магазин, иначе в FunPay
         if o.get("source") == "shop":
             await shop_bot.send_message(o["chat_id"], f"Не удалось найти @{bad} на Fragment. Проверьте username и пришлите его ещё раз.")
         else:
@@ -232,60 +249,241 @@ async def cb_no(c: CallbackQuery):
 # ================== МАГАЗИН (ВТОРОЙ БОТ) ==================
 class ShopStates(StatesGroup):
     waiting_username = State()
+    waiting_custom_amount = State()
+
+def get_main_menu():
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Купить звезды", callback_data="menu_buy")],
+        [InlineKeyboardButton(text="👤 Профиль", callback_data="menu_profile"), 
+         InlineKeyboardButton(text="🤝 Реферальная система", callback_data="menu_ref")],
+        [InlineKeyboardButton(text="🆘 Поддержка", url="https://t.me/gyjov")]
+    ])
+    return kb
+
+def get_buy_menu():
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="50 ⭐", callback_data="buy_50"), 
+         InlineKeyboardButton(text="100 ⭐", callback_data="buy_100")],
+        [InlineKeyboardButton(text="200 ⭐", callback_data="buy_200"), 
+         InlineKeyboardButton(text="500 ⭐", callback_data="buy_500")],
+        [InlineKeyboardButton(text="1000 ⭐", callback_data="buy_1000")],
+        [InlineKeyboardButton(text="✍️ Указать свое количество", callback_data="buy_custom")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]
+    ])
+    return kb
 
 @shop_router.message(CommandStart())
-async def shop_start(m: Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Купить 100 Stars", callback_data="buy_100")],
-        [InlineKeyboardButton(text="Купить 500 Stars", callback_data="buy_500")],
-        [InlineKeyboardButton(text="Купить 1000 Stars", callback_data="buy_1000")],
-    ])
-    await m.answer("Добро пожаловать в магазин Stars! Выберите пакет:", reply_markup=kb)
+async def shop_start(m: Message, state: FSMContext):
+    await state.clear()
+    
+    args = m.text.split()
+    if len(args) > 1 and args[1].startswith("ref_"):
+        referrer_id = args[1].replace("ref_", "")
+        user_id = str(m.from_user.id)
+        
+        if user_id not in users and referrer_id != user_id:
+            if referrer_id in users:
+                users[user_id] = {"ref_by": referrer_id, "ref_count": 0, "earned": 0}
+                users[referrer_id]["ref_count"] = users[referrer_id].get("ref_count", 0) + 1
+                save_users()
+                try:
+                    await shop_bot.send_message(int(referrer_id), "🎉 По вашей ссылке зарегистрировался новый пользователь!")
+                except:
+                    pass
+        elif user_id in users and not users[user_id].get("ref_by") and referrer_id != user_id:
+             if referrer_id in users:
+                users[user_id]["ref_by"] = referrer_id
+                users[referrer_id]["ref_count"] = users[referrer_id].get("ref_count", 0) + 1
+                save_users()
 
-@shop_router.callback_query(F.data.startswith("buy_"))
+    user_id = str(m.from_user.id)
+    if user_id not in users:
+        users[user_id] = {"ref_by": None, "ref_count": 0, "earned": 0}
+        save_users()
+
+    await m.answer("👋 Добро пожаловать в магазин Stars!\n\nВыберите нужное действие в меню ниже:", reply_markup=get_main_menu())
+
+@shop_router.callback_query(F.data == "menu_back")
+async def menu_back(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.message.edit_text("👋 Главное меню:", reply_markup=get_main_menu())
+    await c.answer()
+
+@shop_router.callback_query(F.data == "menu_buy")
+async def menu_buy(c: CallbackQuery):
+    await c.message.edit_text(
+        "⭐ Выберите количество звезд для покупки.\n"
+        "Минимальный заказ: 50 звезд.", 
+        reply_markup=get_buy_menu()
+    )
+    await c.answer()
+
+@shop_router.callback_query(F.data == "menu_profile")
+async def menu_profile(c: CallbackQuery):
+    user_id = str(c.from_user.id)
+    u = users.get(user_id, {"ref_count": 0, "earned": 0})
+    
+    text = (
+        f"👤 <b>Ваш профиль</b>\n\n"
+        f"🆔 Ваш ID: <code>{user_id}</code>\n"
+        f"👥 Приглашено людей: <b>{u.get('ref_count', 0)}</b>\n"
+        f"💰 Заработано с рефералов: <b>{u.get('earned', 0)}</b> (в Stars)\n"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]])
+    await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await c.answer()
+
+@shop_router.callback_query(F.data == "menu_ref")
+async def menu_ref(c: CallbackQuery):
+    user_id = str(c.from_user.id)
+    bot_info = await shop_bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
+    
+    text = (
+        f"🤝 <b>Реферальная система</b>\n\n"
+        f"Приглашайте друзей и получайте 10% от их покупок!\n\n"
+        f"🔗 Ваша ссылка для приглашения:\n"
+        f"<code>{ref_link}</code>\n\n"
+        f"Отправьте её друзьям. Когда они купят звезды, вы получите вознаграждение в Stars на свой баланс (выплаты производятся вручную)."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]])
+    await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await c.answer()
+
+# --- ПОКУПКА ЗВЕЗД ---
+@shop_router.callback_query(F.data.startswith("buy_") & ~F.data.contains("custom"))
 async def process_buy(c: CallbackQuery, state: FSMContext):
     amount = int(c.data.split("_")[1])
-    
-    # ВНИМАНИЕ: Здесь должна быть интеграция с платежной системой!
-    # Сейчас бот считает, что оплата уже прошла.
-    
     await state.update_data(amount=amount)
     await state.set_state(ShopStates.waiting_username)
     
     await c.message.edit_text(
-        f"Вы выбрали {amount} Stars.\n\n"
+        f"Вы выбрали <b>{amount}</b> Stars.\n\n"
         f"Пожалуйста, отправьте Telegram username (например, @username), "
-        f"на который нужно зачислить Stars."
+        f"на который нужно зачислить Stars.",
+        parse_mode="HTML"
     )
     await c.answer()
+
+@shop_router.callback_query(F.data == "buy_custom")
+async def process_custom_buy(c: CallbackQuery, state: FSMContext):
+    await state.set_state(ShopStates.waiting_custom_amount)
+    await c.message.edit_text(
+        "✍️ Введите желаемое количество звезд.\n"
+        f"Минимальное количество: <b>{MIN_STARS}</b> звезд.",
+        parse_mode="HTML"
+    )
+    await c.answer()
+
+@shop_router.message(ShopStates.waiting_custom_amount)
+async def process_custom_amount(m: Message, state: FSMContext):
+    if not m.text.isdigit():
+        return await m.answer("❌ Пожалуйста, введите целое число.")
+    
+    amount = int(m.text)
+    if amount < MIN_STARS:
+        return await m.answer(f"❌ Минимальное количество звезд: {MIN_STARS}.")
+    
+    await state.update_data(amount=amount)
+    await state.set_state(ShopStates.waiting_username)
+    await m.answer(
+        f"Вы выбрали <b>{amount}</b> Stars.\n\n"
+        f"Пожалуйста, отправьте Telegram username (например, @username), "
+        f"на который нужно зачислить Stars.",
+        parse_mode="HTML"
+    )
 
 @shop_router.message(ShopStates.waiting_username)
 async def get_username(m: Message, state: FSMContext):
     username = m.text.strip()
     if not username.startswith("@") or len(username) < 5:
-        return await m.answer("Пожалуйста, отправьте username в правильном формате (например, @username).")
+        return await m.answer("❌ Пожалуйста, отправьте username в правильном формате (например, @username).")
     
     data = await state.get_data()
     amount = data.get("amount")
+    user_id = str(m.from_user.id)
     oid = f"SHOP_{m.from_user.id}_{int(m.date.timestamp())}"
+    
+    # Считаем сумму к оплате
+    price_rub = int(amount * STAR_PRICE_RUB)
+    
+    # Генерируем ссылку на оплату через Quickpay (без токена)
+    params = {
+        "receiver": YOOMONEY_WALLET,
+        "quickpay-form": "shop",
+        "targets": f"Оплата заказа {oid}",
+        "paymentType": "SB", # СБП/карта
+        "sum": price_rub,
+        "label": oid,
+        "successURL": "https://t.me/DopingStars_bot" # Куда вернуть после оплаты
+    }
+    pay_url = "https://yoomoney.ru/quickpay/confirm.xml?" + urlencode(params)
     
     async with lock:
         orders[oid] = {
-            "buyer": m.from_user.username or str(m.from_user.id),
+            "buyer": m.from_user.username or user_id,
             "chat_id": m.chat.id,
             "amount": amount,
             "username": username.replace("@", ""),
-            "status": "processing",
+            "status": "waiting_payment", # Ждем оплаты
             "source": "shop",
             "tries": 0
         }
         save()
     
-    await m.answer(f"Заказ на {amount} Stars для {username} создан. Выдаю...")
-    await notify(f"🆕 Новый заказ из TG-Магазина!\n\n" + order_text(oid, orders[oid]))
+    # Начисление реферальных
+    referrer_id = users.get(user_id, {}).get("ref_by")
+    if referrer_id and referrer_id in users:
+        earned = int(amount * 0.10)
+        users[referrer_id]["earned"] = users[referrer_id].get("earned", 0) + earned
+        save_users()
+        try:
+            await shop_bot.send_message(int(referrer_id), f"💰 Вам начислено <b>{earned} Stars</b> за покупку вашего реферала!", parse_mode="HTML")
+        except:
+            pass
     
-    await deliver(oid)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url)],
+        [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid_{oid}")]
+    ])
+    
+    await m.answer(
+        f"Заказ на {amount} Stars создан!\n"
+        f"Сумма к оплате: <b>{price_rub} руб.</b>\n\n"
+        f"1. Нажмите «Перейти к оплате».\n"
+        f"2. Переведите точную сумму.\n"
+        f"3. Вернитесь и нажмите «Я оплатил».",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
     await state.clear()
+
+@shop_router.callback_query(F.data.startswith("paid_"))
+async def process_paid(c: CallbackQuery):
+    oid = c.data.split("_")[1]
+    async with lock:
+        o = orders.get(oid)
+        if not o or o["status"] != "waiting_payment":
+            return await c.answer("Заказ не найден или уже обработан.", show_alert=True)
+        o["status"] = "ready" # Переводим в статус готовности к выдаче
+        save()
+    
+    await c.message.edit_text("⏳ Заказ отправлен на проверку администратору. Ожидайте выдачи Stars.")
+    await c.answer()
+    
+    # Отправляем админу уведомление с кнопкой "Выдать"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Выдать Stars", callback_data=f"ok:{oid}"),
+        InlineKeyboardButton(text="❌ Отменить", callback_data=f"no:{oid}"),
+    ]])
+    
+    await notify(
+        f"💰 <b>Покупатель нажал «Я оплатил»!</b>\n"
+        f"Проверь поступление {int(o['amount'] * STAR_PRICE_RUB)} руб. на ЮMoney.\n\n"
+        + order_text(oid, o), 
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
 
 # ================== FUNPAY СЛУШАТЕЛЬ ==================
 USERNAME_FULL = re.compile(r"@?([A-Za-z][A-Za-z0-9_]{4,31})")
@@ -420,7 +618,11 @@ async def main():
     asyncio.create_task(funpay_listener())
     asyncio.create_task(shop_dp.start_polling(shop_bot))
     
-    await bot.send_message(ADMIN_ID, f"✅ Основной бот и Магазин запущены. Автовыдача: {'ВКЛ' if AUTO_DELIVERY else 'ВЫКЛ'}")
+    try:
+        await bot.send_message(ADMIN_ID, f"✅ Основной бот и Магазин запущены. Автовыдача: {'ВКЛ' if AUTO_DELIVERY else 'ВЫКЛ'}")
+    except Exception as e:
+        log.error(f"Не удалось отправить сообщение админу. Ошибка: {e}")
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
