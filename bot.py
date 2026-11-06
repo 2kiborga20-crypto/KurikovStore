@@ -624,26 +624,42 @@ async def recover():
             await on_ready(oid)
 
 async def main():
+    log.info("Запуск основного процесса...")
     try:
         await connect()
+        log.info(f"FunPay: вошёл как {funpay.username}")
     except Exception as e:
-        sys.exit(f"Не удалось войти на FunPay: {e}")
-    
-    log.info(f"FunPay: вошёл как {funpay.username}")
+        log.error(f"ОШИБКА ВХОДА НА FUNPAY: {e}")
+        sys.exit(1)
 
-    dp.include_router(router)
-    shop_dp.include_router(shop_router)
+    try:
+        dp.include_router(router)
+        shop_dp.include_router(shop_router)
+        log.info("Роутеры подключены.")
+    except Exception as e:
+        log.error(f"ОШИБКА ПОДКЛЮЧЕНИЯ РОУТЕРОВ: {e}")
+
+    try:
+        await recover()
+        log.info("Восстановление заказов завершено.")
+    except Exception as e:
+        log.error(f"ОШИБКА ВОССТАНОВЛЕНИЯ: {e}")
     
-    await recover()
-    
-    asyncio.create_task(funpay_listener())
-    asyncio.create_task(shop_dp.start_polling(shop_bot))
+    try:
+        asyncio.create_task(funpay_listener())
+        log.info("Слушатель FunPay запущен.")
+        asyncio.create_task(shop_dp.start_polling(shop_bot))
+        log.info("Бот-магазин запущен.")
+    except Exception as e:
+        log.error(f"ОШИБКА ЗАПУСКА БОТОВ: {e}")
     
     try:
         await bot.send_message(ADMIN_ID, f"✅ Основной бот и Магазин запущены. Автовыдача: {'ВКЛ' if AUTO_DELIVERY else 'ВЫКЛ'}")
+        log.info("Сообщение админу о запуске отправлено.")
     except Exception as e:
-        log.error(f"Не удалось отправить сообщение админу. Ошибка: {e}")
+        log.error(f"НЕ УДАЛОСЬ ОТПРАВИТЬ СООБЩЕНИЕ АДМИНУ: {e}")
     
+    log.info("Запуск главного поллинга...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
